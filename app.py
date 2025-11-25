@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -227,8 +229,66 @@ def load_f1_session(year: int, event: str, session_name: str) -> Dict[str, List[
     }
 
 
+def try_fastf1_session(year: int, event: str, session_name: str) -> Dict[str, Any] | None:
+    """Attempt to load real session data via FastF1; return None if unavailable."""
+    try:
+        from utils.session_loader import load_session
+        from features.feature_engineering import build_features as build_real_features
+    except Exception:
+        return None
+
+    try:
+        data = load_session(year, event, session_name)
+        laps = data.get("laps", pd.DataFrame())
+        if laps is None or laps.empty:
+            return None
+        session_obj = data.get("session")
+        event_name = getattr(getattr(session_obj, "event", None), "EventName", str(event))
+        features = build_real_features(laps, event_name=event_name)
+
+        drivers = features["Driver"].tolist()
+        # team mapping
+        team_map: Dict[str, str] = {}
+        driver_team: Dict[str, str] = {}
+        if "Team" in laps.columns:
+            team_pairs = laps[["Driver", "Team"]].dropna().drop_duplicates()
+            driver_team = dict(zip(team_pairs["Driver"], team_pairs["Team"]))
+            for team, grp in team_pairs.groupby("Team"):
+                drv = grp["Driver"].tolist()
+                if len(drv) == 2:
+                    team_map[drv[0]] = drv[1]
+                    team_map[drv[1]] = drv[0]
+
+        # start positions from results if available
+        results = data.get("results", pd.DataFrame())
+        start_map: Dict[str, float] = {}
+        if isinstance(results, pd.DataFrame) and not results.empty:
+            if "Abbreviation" in results.columns:
+                if "GridPosition" in results.columns:
+                    start_map = results.set_index("Abbreviation")["GridPosition"].to_dict()
+                elif "Position" in results.columns:
+                    start_map = results.set_index("Abbreviation")["Position"].to_dict()
+        if start_map:
+            features["start_pos"] = features["Driver"].map(start_map).fillna(len(drivers)).astype(float)
+        elif "start_pos" not in features.columns:
+            features["start_pos"] = np.arange(1, len(drivers) + 1, dtype=float)
+
+        return {
+            "year": year,
+            "event": event_name,
+            "session": session_name,
+            "drivers": drivers,
+            "team_map": team_map,
+            "driver_team": driver_team,
+            "features": features,
+            "source": "fastf1",
+        }
+    except Exception:
+        return None
+
+
 def build_features(session_data: Dict[str, List[str]]) -> pd.DataFrame:
-    """Create a demo feature matrix with pace and volatility signals."""
+    """Create a demo feature matrix with pace and volatility signals (mock)."""
     rng = np.random.default_rng(session_data["year"] + len(session_data["event"]))
     drivers = session_data["drivers"]
     base_pace = np.linspace(1.0, 0.2, num=len(drivers))  # quicker drivers first
@@ -268,17 +328,19 @@ def build_features(session_data: Dict[str, List[str]]) -> pd.DataFrame:
 def predict_mu_sigma(features: pd.DataFrame, use_trained: bool) -> Tuple[np.ndarray, np.ndarray]:
     """Generate mock μ (pace) and σ (volatility) vectors."""
     rng = np.random.default_rng(features.shape[0] + (11 if use_trained else 3))
+    grid_bonus = np.interp(features["start_pos"], (1, 20), (0.06, -0.06))
     base_mu = (
         0.45 * features["pace_score"].to_numpy()
         + 0.2 * features["aero_eff"].to_numpy()
         + 0.1 * features["drs_gain"].to_numpy()
         - 0.05 * features["tyre_deg"].to_numpy()
+        + grid_bonus
     )
-    mu = base_mu + rng.normal(0, 0.025, size=len(features))
-    sigma = (1.1 - features["reliability"].to_numpy()) * 1.3
-    sigma += 0.3 * (features["tyre_deg"].to_numpy() - 1)
-    sigma += rng.normal(0.02, 0.01, size=len(features))
-    sigma = np.clip(sigma, 0.05, None)
+    mu = base_mu + rng.normal(0, 0.02, size=len(features))
+    sigma = (1.05 - features["reliability"].to_numpy()) * 1.1
+    sigma += 0.25 * (features["tyre_deg"].to_numpy() - 1)
+    sigma += rng.normal(0.015, 0.008, size=len(features))
+    sigma = np.clip(sigma, 0.04, None)
     if use_trained:
         mu *= 1.03
         sigma *= 0.9
@@ -291,9 +353,12 @@ def predict_mu_sigma_bayesian(features: pd.DataFrame, scenarios: Dict[str, float
     base_mu = predict_mu_sigma(features, use_trained=True)[0]
     track_effect = scenarios.get("grip_factor", 1.0)
     chaos = scenarios.get("chaos_amp", 0.0)
-    mu = base_mu * track_effect + rng.normal(0, 0.015, size=len(features))
-    sigma = 0.9 * (1.1 - features["reliability"].to_numpy()) + 0.25 * chaos
-    sigma += rng.normal(0.015, 0.005, size=len(features))
+    mu_pool = np.mean(base_mu)
+    mu = 0.85 * (base_mu * track_effect) + 0.15 * mu_pool + rng.normal(0, 0.012, size=len(features))
+    sigma_prior = 0.9 * (1.1 - features["reliability"].to_numpy()) + 0.15 * (features["tyre_deg"].to_numpy() - 1)
+    sigma = 0.75 * sigma_prior + 0.25 * sigma_prior.mean()
+    sigma += 0.2 * chaos
+    sigma += rng.normal(0.012, 0.004, size=len(features))
     sigma = np.clip(sigma, 0.04, None)
     return mu, sigma
 
@@ -302,13 +367,15 @@ def predict_mu_sigma_mixture(features: pd.DataFrame, scenarios: Dict[str, float]
     """Mock mixture/latent form model with two regimes (on-form vs off-form)."""
     rng = np.random.default_rng(456)
     base_mu = predict_mu_sigma(features, use_trained=True)[0]
-    weights = rng.dirichlet(np.ones(2) * (1 + scenarios.get("chaos_amp", 0.0)))
+    chaos = scenarios.get("chaos_amp", 0.0)
+    weights = rng.dirichlet(np.ones(2) * (1 + chaos * 1.5))
     # regime offsets
-    regime_offsets = np.array([0.02, -0.03])
+    regime_offsets = np.array([0.025, -0.04])
     chosen_regime = rng.choice(2, size=len(features), p=weights)
     mu = base_mu + regime_offsets[chosen_regime] + rng.normal(0, 0.02, size=len(features))
-    sigma = 0.08 + 0.4 * (chosen_regime == 1) + 0.2 * (features["tyre_deg"].to_numpy() - 1)
-    sigma = np.clip(sigma, 0.05, None)
+    reliability = features["reliability"].to_numpy()
+    sigma = 0.07 + 0.35 * (chosen_regime == 1) + 0.18 * (features["tyre_deg"].to_numpy() - 1) + 0.15 * (1.05 - reliability)
+    sigma = np.clip(sigma, 0.045, None)
     return mu, sigma, weights
 
 
@@ -340,38 +407,62 @@ def run_monte_carlo(mu: np.ndarray, sigma: np.ndarray, sims: int, scenarios: Dic
 
 
 def simulate_race_events(features: pd.DataFrame, mu: np.ndarray, sigma: np.ndarray, sims: int, scenarios: Dict[str, float]) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
-    """Lap-level event simulator with safety cars, tyre deg, and pit loss."""
+    """Lap-level event simulator with safety cars, tyre deg, and pit loss.
+
+    Optimized for stability:
+    - Interpret retirement slider as per-race probability; convert to per-lap hazard.
+    - Precompute tyre degradation matrix instead of repeating per lap.
+    - Keep DNF order tied to retirement lap rather than array index.
+    """
     rng = np.random.default_rng(777 + sims + len(mu))
     sims = max(sims, 200)
     n_drivers = len(mu)
     laps = 58
     chaos = scenarios.get("chaos_amp", 0.0)
-    retire_prob = scenarios.get("retirement_prob", 0.0)
+    retirement_race_prob = scenarios.get("retirement_prob", 0.0)
     pit_delta = scenarios.get("pit_delta", 0.0)
     grip = scenarios.get("grip_factor", 1.0)
 
+    tyre_deg = features["tyre_deg"].to_numpy()
+    deg_slope = 0.002 * tyre_deg
+    lap_idx = np.arange(laps)
+    deg_matrix = 1 - np.outer(lap_idx, deg_slope)
+    deg_matrix = np.clip(deg_matrix, 0.6, None)  # prevent negative pace late in the race
+
+    # Convert per-race retirement probability to a per-lap hazard and ramp slightly with lap count
+    if retirement_race_prob <= 0:
+        lap_retire_prob = np.zeros(laps)
+    else:
+        base_hazard = 1 - (1 - retirement_race_prob) ** (1 / laps)
+        lap_retire_prob = np.clip(base_hazard * (1 + lap_idx / laps), 0, 0.9)
+
     finish_positions = np.zeros((sims, n_drivers), dtype=int)
-    sc_counts = []
-    retire_counts = []
+    sc_counts: List[int] = []
+    retire_counts: List[int] = []
+
     for s in range(sims):
-        # track safety car events
         safety_car_laps = rng.binomial(1, 0.02 + chaos * 0.5, size=laps)
         sc_counts.append(int(safety_car_laps.sum()))
-        lap_perf = np.zeros((laps, n_drivers))
-        retired = np.zeros(n_drivers, dtype=bool)
-        pit_mask = rng.random((laps, n_drivers)) < 0.02
-        for lap in range(laps):
-            deg_factor = 1 - 0.002 * features["tyre_deg"].to_numpy() * lap
-            lap_mu = mu * grip * deg_factor
-            lap_sigma = sigma * (1 + 0.5 * safety_car_laps[lap]) * (1 + chaos)
-            lap_perf[lap] = rng.normal(lap_mu, lap_sigma)
-            # pits
-            lap_perf[lap] -= pit_mask[lap] * (pit_delta * 0.015)
-            # retirements
-            retire_now = rng.random(n_drivers) < retire_prob * (1 + lap / laps)
-            retired = retired | retire_now
-            lap_perf[lap][retired] = -np.inf
-        retire_counts.append(int(retired.sum()))
+
+        lap_mu = mu * grip * deg_matrix
+        lap_sigma = sigma * (1 + 0.5 * safety_car_laps[:, None]) * (1 + chaos)
+        lap_perf = rng.normal(lap_mu, lap_sigma)
+
+        pit_prob = min(0.04 + chaos * 0.05, 0.25)  # expected ~2–2.5 stops over 58 laps
+        pit_mask = rng.random((laps, n_drivers)) < pit_prob
+        lap_perf -= pit_mask * (pit_delta * 0.015)
+
+        if retirement_race_prob > 0:
+            retire_draws = rng.random((laps, n_drivers)) < lap_retire_prob[:, None]
+            retired_any = retire_draws.any(axis=0)
+            first_retire_lap = np.where(retired_any, retire_draws.argmax(axis=0), laps)
+            # apply a steep penalty from the retirement lap onwards
+            retire_mask = lap_idx[:, None] >= first_retire_lap
+            lap_perf[retire_mask] = -1e6  # harsh penalty keeps DNF order tied to retirement lap
+            retire_counts.append(int(retired_any.sum()))
+        else:
+            retire_counts.append(0)
+
         total_perf = lap_perf.sum(axis=0)
         order = np.argsort(-total_perf)
         finish_positions[s] = np.argsort(order) + 1
@@ -385,6 +476,77 @@ def simulate_race_events(features: pd.DataFrame, mu: np.ndarray, sigma: np.ndarr
         "avg_retirements": float(np.mean(retire_counts)),
     }
     return prob_matrix, finish_positions, summary
+
+
+@st.cache_resource(show_spinner=False)
+def load_trained_bundles() -> Tuple[Any | None, Any | None]:
+    """Load persisted μ and σ models if present."""
+    artifacts = Path("models/artifacts")
+    mu_path = artifacts / "mu.joblib"
+    sigma_path = artifacts / "sigma.joblib"
+    mu_model = joblib.load(mu_path) if mu_path.exists() else None
+    sigma_bundle = joblib.load(sigma_path) if sigma_path.exists() else None
+    return mu_model, sigma_bundle
+
+
+def predict_with_trained(features: pd.DataFrame, mu_model: Any | None, sigma_bundle: Any | None) -> Tuple[np.ndarray | None, np.ndarray | None]:
+    """Predict μ/σ using trained models, handling calibrated sigma bundles."""
+    if mu_model is None and sigma_bundle is None:
+        return None, None
+    feat_matrix = features.drop(columns=["Driver"], errors="ignore")
+
+    def _align(feat_df: pd.DataFrame, ref_model: Any) -> pd.DataFrame:
+        if hasattr(ref_model, "feature_names_in_"):
+            ref_cols = list(ref_model.feature_names_in_)
+            aligned = feat_df.copy()
+            for col in ref_cols:
+                if col not in aligned:
+                    aligned[col] = 0.0
+            return aligned[ref_cols]
+        return feat_df
+
+    mu_pred = None
+    if mu_model is not None:
+        aligned = _align(feat_matrix, mu_model)
+        mu_pred = mu_model.predict(aligned)
+
+    sigma_pred = None
+    if sigma_bundle is not None:
+        sigma_model = sigma_bundle["model"] if isinstance(sigma_bundle, dict) and "model" in sigma_bundle else sigma_bundle
+        aligned_sigma = _align(feat_matrix, sigma_model)
+        try:
+            if isinstance(sigma_bundle, dict) and "calibrator" in sigma_bundle:
+                from models.sigma_model import predict_sigma_calibrated
+
+                sigma_pred = predict_sigma_calibrated(sigma_bundle, aligned_sigma)
+            else:
+                sigma_pred = sigma_bundle.predict(aligned_sigma)
+        except Exception:
+            sigma_pred = None
+    if sigma_pred is not None:
+        sigma_pred = np.clip(sigma_pred, 0.02, None)
+    return mu_pred, sigma_pred
+
+
+def heuristic_from_real_features(features: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """Fallback heuristic μ/σ when trained models are missing but real laps are available."""
+    mu = -features.get("median_lap_s", pd.Series(0, index=features.index)).to_numpy()
+    lap_var = features.get("lap_var", pd.Series(0.25, index=features.index)).fillna(0.25)
+    sigma = np.sqrt(lap_var).to_numpy()
+    sigma = np.clip(sigma, 0.03, None)
+    return mu, sigma
+
+
+def ensure_sim_defaults(features: pd.DataFrame) -> pd.DataFrame:
+    """Add missing columns expected by simulation with reasonable defaults."""
+    feats = features.copy()
+    if "tyre_deg" not in feats.columns:
+        feats["tyre_deg"] = 1.0
+    if "reliability" not in feats.columns:
+        feats["reliability"] = 0.95
+    if "start_pos" not in feats.columns:
+        feats["start_pos"] = np.arange(1, len(feats) + 1, dtype=float)
+    return feats
 
 
 def compute_heatmap(prob_matrix: np.ndarray, drivers: List[str]) -> go.Figure:
@@ -639,7 +801,10 @@ def build_sidebar() -> Tuple[int, str, str, int, bool, bool, Dict[str, float]]:
     retirement_prob = st.sidebar.slider("Retirement probability", min_value=0.0, max_value=0.3, value=0.08, step=0.01)
     pit_delta = st.sidebar.slider("Pit stop delta (s)", min_value=0, max_value=30, value=18, step=1)
     use_trained = st.sidebar.checkbox("Use trained models if available", value=True)
-    st.sidebar.caption("Toggle to see how a model-driven μ/σ would shift results.")
+    st.sidebar.markdown(
+        "<span style='font-size:0.85rem;color:var(--muted);'>Trained μ/σ models use real laps + calibration; they’re more stable than the mock Monte Carlo heuristics.</span>",
+        unsafe_allow_html=True,
+    )
     run_clicked = st.sidebar.button("Run Simulation", use_container_width=True)
 
     scenarios = {
@@ -709,21 +874,65 @@ def main() -> None:
 
     if run_clicked and event:
         with st.spinner("Running Monte Carlo simulation..."):
-            session_data = load_f1_session(year, event, session_name)
-            features = build_features(session_data)
+            session_data = try_fastf1_session(year, event, session_name)
+            if session_data is None:
+                session_data = load_f1_session(year, event, session_name)
+                features = build_features(session_data)
+                session_data["features"] = features
+                session_data["source"] = "mock"
+            features = ensure_sim_defaults(session_data["features"])
             mixture_weights = None
             event_summary: Dict[str, float] | None = None
+            mu_model, sigma_bundle = load_trained_bundles() if use_trained else (None, None)
+            mu_pred, sigma_pred = predict_with_trained(features, mu_model, sigma_bundle) if use_trained else (None, None)
+
             if model_choice == "Heuristic":
-                mu, sigma = predict_mu_sigma(features, use_trained)
+                if mu_pred is None or sigma_pred is None:
+                    if session_data.get("source") == "fastf1":
+                        mu, sigma = heuristic_from_real_features(features)
+                    else:
+                        mu, sigma = predict_mu_sigma(features, use_trained)
+                else:
+                    mu, sigma = mu_pred, sigma_pred
                 prob_matrix, finish_samples = run_monte_carlo(mu, sigma, sims, scenarios)
             elif model_choice == "Bayesian μ/σ":
-                mu, sigma = predict_mu_sigma_bayesian(features, scenarios)
+                if mu_pred is None or sigma_pred is None:
+                    if session_data.get("source") == "fastf1":
+                        mu_base, sigma_base = heuristic_from_real_features(features)
+                    else:
+                        mu_base, sigma_base = predict_mu_sigma(features, use_trained)
+                else:
+                    mu_base, sigma_base = mu_pred, sigma_pred
+                # light pooling toward field mean for stability
+                mu = 0.9 * (mu_base * scenarios.get("grip_factor", 1.0)) + 0.1 * mu_base.mean()
+                sigma = np.clip(0.8 * sigma_base + 0.2 * sigma_base.mean() + 0.15 * scenarios.get("chaos_amp", 0.0), 0.03, None)
                 prob_matrix, finish_samples = run_monte_carlo(mu, sigma, sims, scenarios)
             elif model_choice == "Mixture/latent form":
-                mu, sigma, mixture_weights = predict_mu_sigma_mixture(features, scenarios)
+                if mu_pred is None or sigma_pred is None:
+                    if session_data.get("source") == "fastf1":
+                        base_mu, base_sigma = heuristic_from_real_features(features)
+                    else:
+                        base_mu, base_sigma, mixture_weights = predict_mu_sigma_mixture(features, scenarios)
+                        mu, sigma = base_mu, base_sigma
+                if mu_pred is not None and sigma_pred is not None:
+                    base_mu, base_sigma = mu_pred, sigma_pred
+                if mixture_weights is None:
+                    chaos = scenarios.get("chaos_amp", 0.0)
+                    mixture_weights = np.array([0.6, 0.4]) if chaos > 0.2 else np.array([0.75, 0.25])
+                regime_offsets = np.array([0.02, -0.04])
+                rng = np.random.default_rng(456)
+                chosen_regime = rng.choice(2, size=len(features), p=mixture_weights / mixture_weights.sum())
+                mu = base_mu + regime_offsets[chosen_regime]
+                sigma = np.clip(base_sigma * (1 + 0.15 * (chosen_regime == 1)), 0.04, None)
                 prob_matrix, finish_samples = run_monte_carlo(mu, sigma, sims, scenarios)
             else:
-                mu, sigma = predict_mu_sigma(features, use_trained)
+                if mu_pred is None or sigma_pred is None:
+                    if session_data.get("source") == "fastf1":
+                        mu, sigma = heuristic_from_real_features(features)
+                    else:
+                        mu, sigma = predict_mu_sigma(features, use_trained)
+                else:
+                    mu, sigma = mu_pred, sigma_pred
                 prob_matrix, finish_samples, event_summary = simulate_race_events(features, mu, sigma, sims, scenarios)
 
             heatmap_fig = compute_heatmap(prob_matrix, session_data["drivers"])

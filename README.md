@@ -2,6 +2,8 @@
 
 An end-to-end F1 analytics project: FastF1 data ingestion → feature engineering → ML estimates for mean pace (μ) and volatility (σ) → Monte Carlo simulation → interactive visuals and backtests. Produces full finishing-position distributions, expected finish, podium/top-10 odds, and head-to-head matrices, with a Streamlit dashboard for exploration and calibration. The latest dashboard is a dark, card-based “bento” layout with scenario sliders, multiple model flavors, and auto-detected calendars from FastF1.
 
+Public demo: https://f1-monte-carlo-predictor.streamlit.app/
+
 ## Project Layout
 ```
 f1_monte_carlo/
@@ -50,6 +52,17 @@ f1_monte_carlo/
 
 ## Running with Trained Models
 - Default uses heuristics for μ/σ (or richer mock versions). To use trained models, run `python train_models.py` (downloads sessions, fits CV models) and then set `use_trained_models=True` (CLI/Dashboard/Main). If models aren’t found, the app falls back gracefully.
+
+## Recent Updates
+- FastF1 auto-load: the app now attempts to pull real session laps (with caching) and builds features from them; it falls back to mock data only if FastF1 is unavailable.
+- Trained μ/σ pickup: if `models/artifacts/mu.joblib` and `sigma.joblib` exist (from `python train_models.py`), the dashboard automatically uses them when “Use trained models” is checked; otherwise it uses a real-data heuristic.
+- Lap-level realism: retirement slider is treated as per-race probability (converted to per-lap hazard) and pits/safety-car effects are more stable to prevent runaway DNFs.
+- Training pipeline robustness: feature engineering now converts all lap-time deltas to numeric seconds before model training, preventing dtype errors in cross-validation.
+
+## Motivation & Notes from the Build
+- Motivation: I wanted a fast way to sanity-check paddock narratives with numbers—“Is the midfield really that tight?”—without firing up a notebook each race week.
+- Difficulties: FastF1 can be brittle across seasons, and calibrating σ so tails are believable but not cartoonish required repeated backtests. Lap-level DNFs were especially tricky; naïve per-lap hazards exploded retirements.
+- Takeaways: Shrinkage and small priors beat bespoke heuristics for stability, and translating user-facing knobs (like “retirement probability”) into well-behaved per-lap hazards matters more than fancy visuals.
 
 ## Future Improvements
 - Strategy branches (1-stop vs 2-stop) and safety-car scenario sampling.

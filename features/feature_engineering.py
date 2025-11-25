@@ -133,6 +133,13 @@ def build_features(
         for key, val in weather_feats.items():
             pace[f"avg_{key.lower()}"] = val
 
+    # Convert any timedelta columns to seconds and drop originals to keep models happy
+    td_cols = pace.select_dtypes(include=["timedelta64[ns]"]).columns.tolist()
+    for col in td_cols:
+        pace[f"{col}_s"] = pace[col].dt.total_seconds()
+    if td_cols:
+        pace = pace.drop(columns=td_cols)
+
     # Final clean-up
     # Track-level factors
     track_info = get_track_factors(event_name or "Generic")

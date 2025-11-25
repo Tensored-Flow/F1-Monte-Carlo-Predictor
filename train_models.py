@@ -39,9 +39,11 @@ def collect_training_data(races: Iterable[Tuple[int, str, str]]):
         event_name = data["session"].event.EventName
         feats = build_features(laps, event_name=event_name)
         feats["event"] = event_name
-        # Targets: mu -> rank by fastest lap (lower rank => faster); sigma -> lap variance
-        feats = feats.sort_values("fastest_lap").reset_index(drop=True)
-        feats["mu_target"] = -feats["median_lap_s"]
+        # Targets: mu -> rank by fastest lap seconds (lower is faster); sigma -> lap variance
+        sort_col = "fastest_lap_s" if "fastest_lap_s" in feats.columns else "fastest_lap"
+        feats = feats.sort_values(sort_col).reset_index(drop=True)
+        median_col = "median_lap_s" if "median_lap_s" in feats.columns else "median_lap"
+        feats["mu_target"] = -feats[median_col]
         feats["sigma_target"] = np.sqrt(feats["lap_var"].fillna(0.5))
         rows.append(feats)
     full = pd.concat(rows, axis=0, ignore_index=True)
