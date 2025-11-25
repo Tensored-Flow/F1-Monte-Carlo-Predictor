@@ -1,0 +1,15 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.ff1pkl
+.DS_Store
+.ipynb_checkpoints/
+
+# Data and generated artifacts
+data/cache/
+output/
+
+# Environment
+.env
