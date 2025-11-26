@@ -1,6 +1,6 @@
 # F1 Monte Carlo Race Outcome Predictor
 
-An end-to-end F1 analytics project: FastF1 data ingestion → feature engineering → ML estimates for mean pace (μ) and volatility (σ) → Monte Carlo simulation → interactive visuals and backtests. Produces full finishing-position distributions, expected finish, podium/top-10 odds, and head-to-head matrices, with a Streamlit dashboard for exploration and calibration. The latest dashboard is a dark, card-based “bento” layout with scenario sliders, multiple model flavors, and auto-detected calendars from FastF1.
+An end-to-end F1 analytics project: FastF1 data ingestion → feature engineering → ML estimates for mean pace (μ) and volatility (σ) → Monte Carlo simulation → interactive visuals and backtests. Produces full finishing-position distributions, expected finish, podium/top-10 odds, and head-to-head matrices, with a Streamlit dashboard for exploration and calibration. The latest dashboard is a dark, card-based “bento” layout with scenario sliders, multiple model flavors, auto-detected calendars from FastF1, grid-aware μ, recent-form/DNF priors, and tuned chaos/winner floors for fatter tails.
 
 Public demo: https://f1-monte-carlo-predictor.streamlit.app/
 
@@ -58,11 +58,14 @@ f1_monte_carlo/
 - Trained μ/σ pickup: if `models/artifacts/mu.joblib` and `sigma.joblib` exist (from `python train_models.py`), the dashboard automatically uses them when “Use trained models” is checked; otherwise it uses a real-data heuristic.
 - Lap-level realism: retirement slider is treated as per-race probability (converted to per-lap hazard) and pits/safety-car effects are more stable to prevent runaway DNFs.
 - Training pipeline robustness: feature engineering now converts all lap-time deltas to numeric seconds before model training, preventing dtype errors in cross-validation.
+- Grid/form-aware features: feature builder now ingests grid positions and rolling race form/DNF rates from recent events; heuristics apply a grid advantage when trained models are absent.
+- Tail tuning and calibration: the Monte Carlo layer supports chaos scaling, DNF floors, Dirichlet smoothing, and winner floors; `calibrate_params.py` grid-searches these over historical races and writes the best config to `config/calibration.json`.
+- Backtests: recent calibration runs on ~20 races show improved MAE/Brier and top-5 precision (e.g., 3–4/5 correct in several recent races), but results still depend heavily on μ/σ quality.
 
 ## Motivation & Notes from the Build
 - Motivation: I wanted a fast way to sanity-check paddock narratives with numbers—“Is the midfield really that tight?”—without firing up a notebook each race week.
-- Difficulties: FastF1 can be brittle across seasons, and calibrating σ so tails are believable but not cartoonish required repeated backtests. Lap-level DNFs were especially tricky; naïve per-lap hazards exploded retirements.
-- Takeaways: Shrinkage and small priors beat bespoke heuristics for stability, and translating user-facing knobs (like “retirement probability”) into well-behaved per-lap hazards matters more than fancy visuals.
+- Difficulties: FastF1 can be brittle across seasons, and calibrating σ so tails are believable but not cartoonish required repeated backtests. Lap-level DNFs were especially tricky; naïve per-lap hazards exploded retirements. Small calibration windows make tail tuning noisy; shock winners can still be underweighted. Accuracy is bottlenecked by μ/σ inputs: richer features (grid, penalties, long-run pace, weather) and broader training data are needed to lift MAE/top-5 precision further.
+- Takeaways: Shrinkage and small priors beat bespoke heuristics for stability, translating user-facing knobs (like “retirement probability”) into well-behaved hazards matters more than fancy visuals, and calibration + grid-aware features noticeably improve tails and top-5 hit rates but don’t replace the need for stronger μ/σ models.
 
 ## Future Improvements
 - Strategy branches (1-stop vs 2-stop) and safety-car scenario sampling.

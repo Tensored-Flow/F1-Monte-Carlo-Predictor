@@ -31,6 +31,7 @@ def build_features(
     fp2_laps: Optional[pd.DataFrame] = None,
     weather: Optional[pd.DataFrame] = None,
     event_name: str | None = None,
+    grid_positions: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """
     Transform session data into driver-level features.
@@ -99,6 +100,8 @@ def build_features(
         form = hist.groupby("Driver").agg(
             qual_form=("qual_rolling", lambda s: s.iloc[-1] if len(s) else np.nan),
             race_form=("race_rolling", lambda s: s.iloc[-1] if len(s) else np.nan),
+            race_form_mean=("RacePosition", lambda s: s.tail(3).mean() if len(s) else np.nan),
+            last_finish=("RacePosition", lambda s: s.iloc[-1] if len(s) else np.nan),
             dnf_rate=("DNF", lambda s: s.mean() if "DNF" in hist.columns else np.nan),
         )
         form = form.reset_index()
@@ -106,6 +109,8 @@ def build_features(
     else:
         pace["qual_form"] = np.nan
         pace["race_form"] = np.nan
+        pace["race_form_mean"] = np.nan
+        pace["last_finish"] = np.nan
         pace["dnf_rate"] = np.nan
 
     # Track chaos factor from track status changes (number of incidents)
@@ -139,6 +144,14 @@ def build_features(
         pace[f"{col}_s"] = pace[col].dt.total_seconds()
     if td_cols:
         pace = pace.drop(columns=td_cols)
+
+    # Grid position for the target event (if provided)
+    if grid_positions is not None and not grid_positions.empty:
+        grid_df = grid_positions.reset_index()
+        grid_df.columns = ["Driver", "grid_position"]
+        pace = pace.merge(grid_df, on="Driver", how="left")
+    else:
+        pace["grid_position"] = np.nan
 
     # Final clean-up
     # Track-level factors
